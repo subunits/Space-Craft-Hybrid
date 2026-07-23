@@ -1,4 +1,4 @@
-# Hybrid Spacecraft Attitude Control System (v7.3)
+# Hybrid Spacecraft Attitude Control System (v7.21)
 
 A robust, type-safe spacecraft attitude control simulation written in Haskell, synthesizing multiple generations of flight software architecture (v2.0 through v6.0).
 
