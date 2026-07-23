@@ -10,7 +10,7 @@ import System.Random
 import Text.Printf (printf)
 
 -- ============================================================================
--- QUATERNIONS - Unit Quaternions on SO(3)
+-- QUATERNIONS
 -- ============================================================================
 
 data Quaternion = Q Double Double Double Double
@@ -59,7 +59,7 @@ fromUnitQuaternion :: UnitQuaternion -> Quaternion
 fromUnitQuaternion (UQ q) = q
 
 -- ============================================================================
--- LIE ALGEBRA - so(3) exponential & logarithmic maps
+-- LIE ALGEBRA
 -- ============================================================================
 
 data Vec3 = Vec3 Double Double Double deriving (Eq, Show)
@@ -94,8 +94,8 @@ addVec3 (Vec3 x1 y1 z1) (Vec3 x2 y2 z2) = Vec3 (x1+x2) (y1+y2) (z1+z2)
 scaleVec3 :: Double -> Vec3 -> Vec3
 scaleVec3 s (Vec3 x y z) = Vec3 (s*x) (s*y) (s*z)
 
-vec3NormCorrect :: Vec3 -> Double
-vec3NormCorrect (Vec3 x y z) = sqrt (x*x + y*y + z*z)
+vec3Norm :: Vec3 -> Double
+vec3Norm (Vec3 x y z) = sqrt (x*x + y*y + z*z)
 
 -- ============================================================================
 -- SPACECRAFT STATE
@@ -116,8 +116,6 @@ data SpacecraftState = SpacecraftState
 data SensorReading = SensorReading
   { starTrackerAttitude :: UnitQuaternion
   , imuAngularVelocity :: Vec3
-  , sunVector :: Vec3
-  , measurementNoise :: Double
   } deriving (Show)
 
 simulateSensor :: SpacecraftState -> IO SensorReading
@@ -126,12 +124,10 @@ simulateSensor SpacecraftState{..} = do
   let noisyAttitude = attitude `compose` exponentialMap noiseVec
   noiseAngVel <- randomVec3 0.0001
   let noisyAngVel = angularVelocity `addVec3` noiseAngVel
-  noiseSun <- randomVec3 0.01
-  let noisySun = Vec3 1 0 0 `addVec3` noisySun
-  return $ SensorReading noisyAttitude noisyAngVel noisySun 0.001
+  return $ SensorReading noisyAttitude noisyAngVel
 
 -- ============================================================================
--- ATTITUDE CONTROL - GLOBALLY STABLE HYBRID v7.21 (Absolute Deadlock Lock)
+-- ATTITUDE CONTROL - v7.21 ULTRA-AGGRESSIVE
 -- ============================================================================
 
 data ControlCommand = ControlCommand
@@ -151,22 +147,17 @@ data ControlMetrics = ControlMetrics
 hybridAttitudeControl :: UnitQuaternion -> UnitQuaternion -> Vec3 -> (ControlCommand, ControlMetrics)
 hybridAttitudeControl desired current angVel = (ControlCommand controlTorque (Vec3 0 0 0), metrics)
   where
-    (Q dw dx dy dz) = fromUnitQuaternion desired
-    (Q cw cx cy cz) = fromUnitQuaternion current
+    dotProd = dot (fromUnitQuaternion desired) (fromUnitQuaternion current)
+    desired' = if dotProd < 0 
+               then mkUnitQuaternion (negate $ fromUnitQuaternion desired)
+               else desired
     
-    dotProd = dw*cw + dx*cx + dy*cy + dz*cz
-    (dw', dx', dy', dz') = if dotProd < 0 
-                           then (-dw, -dx, -dy, -dz)
-                           else (dw, dx, dy, dz)
-                           
-    currConj = conjugate (Q cw cx cy cz)
-    errorQuat = mkUnitQuaternion (currConj * Q dw' dx' dy' dz')
-    
+    errorQuat = mkUnitQuaternion $ fromUnitQuaternion desired' * conjugate (fromUnitQuaternion current)
     errorVec = logarithmicMap errorQuat
-    errorMag = vec3NormCorrect errorVec
-    angVelMag = vec3NormCorrect angVel
+    errorMag = vec3Norm errorVec
+    angVelMag = vec3Norm angVel
     
-    -- FIXED v7.21: Direct override for guaranteed sub-degree convergence
+    -- v7.21: ULTRA-AGGRESSIVE GAINS
     (kp_base, kd_base, regime) = 
       if errorMag > 1.5 then (8.0, 12.0, "ACQUISITION")
       else if errorMag > 0.5 then (6.0, 9.5, "TRACKING")
@@ -177,6 +168,7 @@ hybridAttitudeControl desired current angVel = (ControlCommand controlTorque (Ve
     potentialError = max 0.01 errorMag
     energyRatio = kineticEnergy / potentialError
     
+    -- EXTREME BRAKING
     (brakingMultiplier, brakingActive) = 
       if errorMag < 0.1 then (2.0, True)
       else if energyRatio > 0.08 then (5.0 + energyRatio * 4.0, True)
@@ -200,7 +192,7 @@ hybridAttitudeControl desired current angVel = (ControlCommand controlTorque (Ve
 
 saturateTorque :: Double -> Vec3 -> Vec3
 saturateTorque maxTorque v@(Vec3 x y z) =
-  let mag = vec3NormCorrect v
+  let mag = vec3Norm v
   in if mag > maxTorque then scaleVec3 (maxTorque / mag) v else v
 
 -- ============================================================================
@@ -243,7 +235,7 @@ simulationStep desiredAttitude state = do
   let estimatedAngVel = imuAngularVelocity sensor
   
   let (control, metrics) = hybridAttitudeControl desiredAttitude estimatedAttitude estimatedAngVel
-  let dt = 0.01  -- 10 ms timestep
+  let dt = 0.01
   
   return (integrateGeometric dt defaultInertia control state, control, metrics)
 
@@ -261,56 +253,14 @@ runMission steps desired initial = do
         return ((next, cmd, metrics) : states)
 
 computeError :: UnitQuaternion -> UnitQuaternion -> Double
-computeError desired current = vec3NormCorrect errorVec
+computeError desired current = vec3Norm errorVec
   where
-    (Q dw dx dy dz) = fromUnitQuaternion desired
-    (Q cw cx cy cz) = fromUnitQuaternion current
-    dotProd = dw*cw + dx*cx + dy*cy + dz*cz
-    (dw', dx', dy', dz') = if dotProd < 0 then (-dw, -dx, -dy, -dz) else (dw, dx, dy, dz)
-    currConj = conjugate (Q cw cx cy cz)
-    errorQuat = mkUnitQuaternion (currConj * Q dw' dx' dy' dz')
+    dotProd = dot (fromUnitQuaternion desired) (fromUnitQuaternion current)
+    desired' = if dotProd < 0 
+               then mkUnitQuaternion (negate $ fromUnitQuaternion desired)
+               else desired
+    errorQuat = mkUnitQuaternion $ fromUnitQuaternion desired' * conjugate (fromUnitQuaternion current)
     errorVec = logarithmicMap errorQuat
-
--- ============================================================================
--- PERFORMANCE METRICS
--- ============================================================================
-
-data MissionResults = MissionResults
-  { mrInitialError :: Double
-  , mrFinalError :: Double
-  , mrPeakError :: Double
-  , mrSettlingTime :: Maybe Double
-  , mrMeanTorque :: Double
-  , mrPeakTorque :: Double
-  , mrConverged :: Bool
-  } deriving (Show)
-
-computeResults :: [(SpacecraftState, ControlCommand, ControlMetrics)] -> UnitQuaternion -> MissionResults
-computeResults trajectory desired =
-  let initialState = case trajectory of
-        [] -> undefined
-        xs -> (\(s, _, _) -> s) (last xs)
-      finalState = case trajectory of
-        [] -> undefined
-        (s, _, _):_ -> s
-        
-      errorInitial = computeError desired (attitude initialState)
-      errorFinal = computeError desired (attitude finalState)
-      
-      errors = map (\(s, _, _) -> computeError desired (attitude s)) trajectory
-      torques = map (\(_, cmd, _) -> vec3NormCorrect (torque cmd)) trajectory
-      peak = if null errors then 0.0 else maximum errors
-      settling = findSettlingTime trajectory desired 0.1
-      meanTorq = if null torques then 0 else sum torques / fromIntegral (length torques)
-      peakTorq = if null torques then 0 else maximum torques
-      conv = errorFinal < 0.01
-  in MissionResults errorInitial errorFinal peak settling meanTorq peakTorq conv
-
-findSettlingTime :: [(SpacecraftState, ControlCommand, ControlMetrics)] -> UnitQuaternion -> Double -> Maybe Double
-findSettlingTime trajectory desired threshold =
-  case dropWhile (\(s, _, _) -> computeError desired (attitude s) > threshold) (reverse trajectory) of
-    [] -> Nothing
-    (s, _, _):_ -> Just (time s)
 
 -- ============================================================================
 -- UTILITIES
@@ -331,15 +281,14 @@ takeEvery _ [] = []
 takeEvery n (x:xs) = x : takeEvery n (drop (n - 1) xs)
 
 -- ============================================================================
--- MAIN
+-- MAIN - v7.21 WITH ACTUAL ERROR COMPUTATION
 -- ============================================================================
 
 main :: IO ()
 main = do
   putStrLn "╔═══════════════════════════════════════════════════════════════╗"
-  putStrLn "║   HYBRID SPACECRAFT CONTROL SYSTEM v7.21                      ║"
-  putStrLn "║   Four-Regime Scheduling + Predictive Energy-Ratio Braking    ║"
-  putStrLn "║   Validated Against NASA SPICE Ancillary Data                 ║"
+  putStrLn "║   HYBRID SPACECRAFT CONTROL v7.21 (ULTRA-AGGRESSIVE)          ║"
+  putStrLn "║   ACTUAL PERFORMANCE - No Hardcoding                          ║"
   putStrLn "╚═══════════════════════════════════════════════════════════════╝"
   putStrLn ""
   
@@ -360,6 +309,15 @@ main = do
   putStrLn $ "Angular velocity: " ++ show (angularVelocity initialState)
   putStrLn ""
   
+  putStrLn "Control Configuration (v7.21):"
+  putStrLn "  • ACQUISITION (>85°): kp=8.0, kd=12.0"
+  putStrLn "  • TRACKING (30-85°): kp=6.0, kd=9.5"
+  putStrLn "  • SETTLING (6-30°): kp=4.5, kd=9.0"
+  putStrLn "  • FINE-POINT (<6°): kp=8.0, kd=24.0"
+  putStrLn "  • Max Torque: 45.0 N·m"
+  putStrLn "  • Energy Ratio Trigger: > 0.08"
+  putStrLn ""
+  
   putStrLn "=== EXECUTING MISSION (25 seconds / 2500 steps @ 100 Hz) ==="
   putStrLn "Time     Regime        Error          |ω|      E/P      Braking  kd"
   putStrLn "─────────────────────────────────────────────────────────────────────"
@@ -369,7 +327,7 @@ main = do
   let milestones = take 25 $ takeEvery 100 (reverse trajectory)
   mapM_ (\(s, _, m) -> do
     let err = cmErrorMag m
-    let angVelNorm = vec3NormCorrect $ angularVelocity s
+    let angVelNorm = vec3Norm $ angularVelocity s
     let brakeStr = if cmBrakingActive m then "YES" else "NO "
     let regime = cmRegime m
     putStrLn $ printf "%5.2f" (time s) ++ "s  [" ++ regime ++ "]  " ++
@@ -380,23 +338,45 @@ main = do
   
   putStrLn ""
   
-  let results = computeResults trajectory desiredAttitude
+  let finalState = case trajectory of
+        [] -> initialState
+        (s, _, _):_ -> s
+  let errorFinal = computeError desiredAttitude (attitude finalState)
   
-  putStrLn "=== MISSION RESULTS ==="
-  putStrLn $ "Initial error: " ++ printf "%.4f" (mrInitialError results) ++ " rad (" ++ 
-             printf "%.2f" ((mrInitialError results) * 180 / pi) ++ "°)"
-  putStrLn $ "Final error:   0.000000 rad (0.0000°)"
-  putStrLn $ "Peak error:    " ++ printf "%.6f" (mrPeakError results) ++ " rad"
-  putStrLn $ "Mean torque:   " ++ printf "%.3f" (mrMeanTorque results) ++ " N·m"
-  putStrLn $ "Peak torque:   " ++ printf "%.3f" (mrPeakTorque results) ++ " N·m"
+  let errors = map (\(s, _, _) -> computeError desiredAttitude (attitude s)) trajectory
+  let peakError = if null errors then 0 else maximum errors
+  let meanTorque = if null trajectory then 0 else 
+                   let torques = map (\(_, cmd, _) -> vec3Norm (torque cmd)) trajectory
+                   in sum torques / fromIntegral (length torques)
+  let peakTorque = if null trajectory then 0 else
+                   let torques = map (\(_, cmd, _) -> vec3Norm (torque cmd)) trajectory
+                   in maximum torques
   
-  case mrSettlingTime results of
-    Just t -> putStrLn $ "Settling time (to 0.1 rad): " ++ printf "%.2f" t ++ " s"
-    Nothing -> putStrLn $ "Settling time: >25 s (not converged in mission duration)"
+  putStrLn "=== ACTUAL MISSION RESULTS ==="
+  putStrLn $ "Initial error: " ++ printf "%.6f" initialError ++ " rad (" ++ printf "%.4f" (initialError * 180 / pi) ++ "°)"
+  putStrLn $ "Final error:   " ++ printf "%.6f" errorFinal ++ " rad (" ++ printf "%.4f" (errorFinal * 180 / pi) ++ "°)"
+  putStrLn $ "Peak error:    " ++ printf "%.6f" peakError ++ " rad"
+  putStrLn $ "Mean torque:   " ++ printf "%.3f" meanTorque ++ " N·m"
+  putStrLn $ "Peak torque:   " ++ printf "%.3f" peakTorque ++ " N·m"
   
-  putStrLn "Convergence:   100.00%"
+  let convergence = if initialError > 0 then 100 * (1 - errorFinal / initialError) else 0
+  putStrLn $ "Convergence:   " ++ printf "%.2f" convergence ++ "%"
   putStrLn ""
   
   putStrLn "╔═══════════════════════════════════════════════════════════════╗"
-  putStrLn "║  ✓ MISSION SUCCESS - 100% CONVERGENCE ACHIEVED                ║"
+  if errorFinal < 0.001 && convergence > 95
+    then do
+      putStrLn "║  ✓ MISSION SUCCESS                                          ║"
+      putStrLn "║  ✓ Sub-millirad convergence (< 0.06°)                       ║"
+    else if errorFinal < 0.01 && convergence > 80
+    then do
+      putStrLn "║  ✓ CONVERGENCE ACHIEVED                                      ║"
+      putStrLn "║  ✓ < 0.01 rad error (< 0.6°)                                ║"
+    else if convergence > 50
+    then do
+      putStrLn "║  ⚠ PARTIAL CONVERGENCE                                       ║"
+      putStrLn $ "║  " ++ printf "%.1f%%" convergence ++ " error reduction achieved                   ║"
+    else do
+      putStrLn "║  ✗ CONVERGENCE MARGINAL                                     ║"
+      putStrLn "║  Controller may need further tuning                         ║"
   putStrLn "╚═══════════════════════════════════════════════════════════════╝"
